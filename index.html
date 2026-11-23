@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="株価">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" content="#f5f5f7">
+<link rel="apple-touch-icon" href="icon-180.png">
+<title>株価ウォッチ</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f5f5f7; --card:#fff; --text:#1d1d1f; --sub:#6e6e73; --line:#e5e5ea; --up:#d70015; --down:#0a7d32; --accent:#0071e3; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#000; --card:#1c1c1e; --text:#f5f5f7; --sub:#98989d; --line:#2c2c2e; --up:#ff6b6b; --down:#4cd964; --accent:#0a84ff; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans",sans-serif; padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+  header { display:flex; align-items:center; justify-content:space-between; padding:16px 16px 8px; }
+  h1 { font-size:22px; margin:0; }
+  button { font:inherit; border:0; border-radius:10px; padding:10px 14px; background:var(--accent); color:#fff; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--accent); padding:10px 6px; }
+  button.danger { background:transparent; color:var(--up); padding:6px 8px; }
+  main { padding:0 16px 32px; }
+  .card { background:var(--card); border-radius:14px; padding:14px 16px; margin:10px 0; }
+  .row { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+  .sym { font-weight:700; font-size:17px; }
+  .name { color:var(--sub); font-size:12px; }
+  .price { font-size:26px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .chg { font-size:15px; font-variant-numeric:tabular-nums; }
+  .up { color:var(--up); } .down { color:var(--down); }
+  .meta { display:flex; justify-content:space-between; color:var(--sub); font-size:13px; margin-top:8px; border-top:1px solid var(--line); padding-top:8px; }
+  .err { color:var(--up); font-size:14px; margin-top:6px; }
+  input, select { font:inherit; width:100%; padding:10px; border-radius:10px; border:1px solid var(--line); background:var(--bg); color:var(--text); }
+  label { display:block; font-size:13px; color:var(--sub); margin:12px 0 4px; }
+  .add { display:flex; gap:8px; margin-top:8px; }
+  .status { color:var(--sub); font-size:12px; text-align:center; margin:12px 0; }
+  .hidden { display:none; }
+  .hint { color:var(--sub); font-size:12px; line-height:1.6; }
+</style>
+</head>
+<body>
+<header>
+  <h1>株価ウォッチ</h1>
+  <div>
+    <button class="ghost" id="settingsBtn">設定</button>
+    <button id="refreshBtn">更新</button>
+  </div>
+</header>
+<main>
+  <section id="settings" class="card hidden">
+    <label for="provider">データ提供元</label>
+    <select id="provider">
+      <option value="alphavantage">Alpha Vantage(無料: 1日25回)</option>
+      <option value="twelvedata">Twelve Data(無料: 1日800回・米国株)</option>
+    </select>
+    <label for="apikey">APIキー(この端末の中にだけ保存されます)</label>
+    <input id="apikey" type="password" autocomplete="off" placeholder="取得したAPIキーを貼り付け">
+    <p class="hint">
+      Alpha Vantage: 米国株は <b>AAPL</b>、東証は <b>7203.TYO</b> のように入力します(東証の対応状況は要確認)。<br>
+      Twelve Data: 米国株の例 <b>AAPL</b>。日本株は無料プランでは使えない場合があります。
+    </p>
+    <button id="saveSettings">保存</button>
+  </section>
+
+  <div class="add">
+    <input id="newSymbol" placeholder="銘柄コードを追加(例: AAPL)" autocapitalize="characters" autocorrect="off">
+    <button id="addBtn">追加</button>
+  </div>
+
+  <div id="list"></div>
+  <div class="status" id="status"></div>
+</main>
+
+<script>
+"use strict";
+const LS = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+};
+
+let state = {
+  provider: LS.get("provider", "alphavantage"),
+  apikey: LS.get("apikey", ""),
+  symbols: LS.get("symbols", ["AAPL", "MSFT"]),
+  cache: LS.get("cache", {})
+};
+
+const $ = id => document.getElementById(id);
+const listEl = $("list"), statusEl = $("status");
+
+function fmtNum(n, digits) {
+  if (n === null || n === undefined || isNaN(n)) return "-";
+  return Number(n).toLocaleString("ja-JP", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+function fmtVol(n) {
+  if (n === null || n === undefined || isNaN(n)) return "-";
+  return Number(n).toLocaleString("ja-JP", { maximumFractionDigits: 0 });
+}
+
+// ---- データ取得 ----
+async function fetchAlphaVantage(symbol, key) {
+  const url = "https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=" +
+    encodeURIComponent(symbol) + "&apikey=" + encodeURIComponent(key);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("通信エラー (" + res.status + ")");
+  const j = await res.json();
+  if (j.Note || j.Information) throw new Error("利用回数の上限に達した可能性があります(1日25回まで)");
+  if (j["Error Message"]) throw new Error("銘柄コードが見つかりません");
+  const q = j["Global Quote"];
+  if (!q || !q["05. price"]) throw new Error("データがありません(銘柄コードを確認してください)");
+  return {
+    price: parseFloat(q["05. price"]),
+    change: parseFloat(q["09. change"]),
+    changePct: parseFloat(String(q["10. change percent"]).replace("%", "")),
+    volume: parseInt(q["06. volume"], 10),
+    date: q["07. latest trading day"],
+    name: ""
+  };
+}
+
+async function fetchTwelveData(symbol, key) {
+  const url = "https://api.twelvedata.com/quote?symbol=" + encodeURIComponent(symbol) +
+    "&apikey=" + encodeURIComponent(key);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("通信エラー (" + res.status + ")");
+  const j = await res.json();
+  if (j.status === "error" || j.code) throw new Error(j.message || "取得に失敗しました");
+  return {
+    price: parseFloat(j.close),
+    change: parseFloat(j.change),
+    changePct: parseFloat(j.percent_change),
+    volume: parseInt(j.volume, 10),
+    date: j.datetime || "",
+    name: j.name || ""
+  };
+}
+
+async function fetchQuote(symbol) {
+  if (!state.apikey) throw new Error("設定からAPIキーを入力してください");
+  return state.provider === "twelvedata"
+    ? fetchTwelveData(symbol, state.apikey)
+    : fetchAlphaVantage(symbol, state.apikey);
+}
+
+// ---- 表示 ----
+function render() {
+  listEl.textContent = "";
+  if (state.symbols.length === 0) {
+    const p = document.createElement("div");
+    p.className = "status";
+    p.textContent = "銘柄を追加してください";
+    listEl.appendChild(p);
+    return;
+  }
+  for (const sym of state.symbols) {
+    const d = state.cache[sym];
+    const card = document.createElement("div");
+    card.className = "card";
+
+    const top = document.createElement("div");
+    top.className = "row";
+    const left = document.createElement("div");
+    const s = document.createElement("div"); s.className = "sym"; s.textContent = sym;
+    left.appendChild(s);
+    if (d && d.name) { const n = document.createElement("div"); n.className = "name"; n.textContent = d.name; left.appendChild(n); }
+    const del = document.createElement("button");
+    del.className = "danger"; del.textContent = "削除";
+    del.addEventListener("click", () => removeSymbol(sym));
+    top.appendChild(left); top.appendChild(del);
+    card.appendChild(top);
+
+    if (d && d.error) {
+      const e = document.createElement("div"); e.className = "err"; e.textContent = d.error;
+      card.appendChild(e);
+    }
+    if (d && d.price !== undefined && !isNaN(d.price)) {
+      const r = document.createElement("div"); r.className = "row";
+      const p = document.createElement("div"); p.className = "price"; p.textContent = fmtNum(d.price, 2);
+      const c = document.createElement("div");
+      const up = d.change >= 0;
+      c.className = "chg " + (up ? "up" : "down");
+      c.textContent = (up ? "+" : "") + fmtNum(d.change, 2) + " (" + (up ? "+" : "") + fmtNum(d.changePct, 2) + "%)";
+      r.appendChild(p); r.appendChild(c);
+      card.appendChild(r);
+
+      const m = document.createElement("div"); m.className = "meta";
+      const v = document.createElement("span"); v.textContent = "出来高 " + fmtVol(d.volume);
+      const t = document.createElement("span"); t.textContent = d.date || "";
+      m.appendChild(v); m.appendChild(t);
+      card.appendChild(m);
+    } else if (!d) {
+      const e = document.createElement("div"); e.className = "name"; e.textContent = "「更新」を押すと取得します";
+      card.appendChild(e);
+    }
+    listEl.appendChild(card);
+  }
+}
+
+function setStatus(msg) { statusEl.textContent = msg; }
+
+async function refresh() {
+  const btn = $("refreshBtn");
+  btn.disabled = true; btn.textContent = "更新中…";
+  let ok = 0;
+  for (let i = 0; i < state.symbols.length; i++) {
+    const sym = state.symbols[i];
+    setStatus("取得中: " + sym + " (" + (i + 1) + "/" + state.symbols.length + ")");
+    try {
+      state.cache[sym] = await fetchQuote(sym);
+      ok++;
+    } catch (e) {
+      const prev = state.cache[sym] || {};
+      state.cache[sym] = Object.assign({}, prev, { error: e.message || String(e) });
+    }
+    render();
+    // 無料プランの毎分上限を避けるため少し待つ
+    if (i < state.symbols.length - 1) await new Promise(r => setTimeout(r, 1200));
+  }
+  LS.set("cache", state.cache);
+  const now = new Date();
+  setStatus("最終更新: " + now.toLocaleString("ja-JP") + "  (成功 " + ok + "/" + state.symbols.length + ")");
+  btn.disabled = false; btn.textContent = "更新";
+}
+
+function addSymbol() {
+  const input = $("newSymbol");
+  const sym = input.value.trim().toUpperCase();
+  if (!sym) return;
+  if (!/^[A-Z0-9.\-:]{1,20}$/.test(sym)) { setStatus("銘柄コードの形式が正しくありません"); return; }
+  if (!state.symbols.includes(sym)) {
+    state.symbols.push(sym);
+    LS.set("symbols", state.symbols);
+  }
+  input.value = "";
+  render();
+}
+
+function removeSymbol(sym) {
+  state.symbols = state.symbols.filter(s => s !== sym);
+  delete state.cache[sym];
+  LS.set("symbols", state.symbols);
+  LS.set("cache", state.cache);
+  render();
+}
+
+// ---- 設定 ----
+$("settingsBtn").addEventListener("click", () => {
+  $("settings").classList.toggle("hidden");
+  $("provider").value = state.provider;
+  $("apikey").value = state.apikey;
+});
+$("saveSettings").addEventListener("click", () => {
+  state.provider = $("provider").value;
+  state.apikey = $("apikey").value.trim();
+  LS.set("provider", state.provider);
+  LS.set("apikey", state.apikey);
+  $("settings").classList.add("hidden");
+  setStatus("設定を保存しました。「更新」を押してください");
+});
+$("refreshBtn").addEventListener("click", refresh);
+$("addBtn").addEventListener("click", addSymbol);
+$("newSymbol").addEventListener("keydown", e => { if (e.key === "Enter") addSymbol(); });
+
+render();
+if (!state.apikey) { $("settings").classList.remove("hidden"); setStatus("最初にAPIキーを設定してください"); }
+</script>
+</body>
+</html>
